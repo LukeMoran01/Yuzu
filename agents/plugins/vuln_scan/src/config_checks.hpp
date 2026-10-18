@@ -9,6 +9,7 @@
 #include <istream>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -132,7 +133,34 @@ inline bool directive_present(const std::vector<std::string>& lines, std::string
 inline constexpr std::string_view kAslrPath = "/proc/sys/kernel/randomize_va_space";
 inline constexpr std::string_view kSuidPath = "/proc/sys/fs/suid_dumpable";
 inline constexpr std::string_view kSshdConfigPath = "/etc/ssh/sshd_config";
-inline constexpr std::string_view kMountsPath = "/proc/mounts";
+inline constexpr std::string_view kMountInfoPath = "/proc/self/mountinfo";
+
+// Whitespace-separated fields of one mount-table line. The kernel octal-escapes
+// whitespace and backslash inside a field (\040, \011, \012, \134), so a plain
+// split is exact.
+inline std::vector<std::string_view> split_fields(std::string_view line) {
+    std::vector<std::string_view> fields;
+    constexpr std::string_view ws = " \t";
+    auto start = line.find_first_not_of(ws);
+    while (start != std::string_view::npos) {
+        auto end = line.find_first_of(ws, start);
+        fields.push_back(line.substr(start, end - start));
+        start = line.find_first_not_of(ws, end);
+    }
+    return fields;
+}
+
+// True when `option` is one exact token of a comma-separated mount options field.
+inline bool has_mount_option(std::string_view options, std::string_view option) {
+    while (true) {
+        auto comma = options.find(',');
+        if (options.substr(0, comma) == option)
+            return true;
+        if (comma == std::string_view::npos)
+            return false;
+        options.remove_prefix(comma + 1);
+    }
+}
 
 // An absent sshd_config means no SSH server config to weaken -- not a finding.
 inline ConfigCheckResult sshd_not_applicable(std::string_view title) {
@@ -207,22 +235,44 @@ inline std::optional<ConfigCheckResult> ssh_password_auth_check(const LinesResul
     return std::nullopt;
 }
 
-// nullopt when /proc/mounts has no separate /tmp mount: no row is emitted (unchanged).
+// Judges the mount on top of /tmp, from /proc/self/mountinfo. The list is in
+// creation order, not stacking order, so tops are found by parent IDs: a /tmp
+// entry (field 5) whose mount ID (field 1) is no other /tmp entry's parent ID
+// (field 2) (#5517). The mount in effect is always a top; a table can hold
+// more than one (an overmounted ancestor), so /tmp passes only when every top
+// has noexec as a token of its per-mount options (field 6). A /tmp entry too
+// short to carry them is not noexec. nullopt when /tmp is not a separate
+// mount: no row is emitted.
 inline std::optional<ConfigCheckResult> tmp_noexec_check(const LinesResult& r) {
     constexpr std::string_view title = "/tmp noexec";
     if (!r)
-        return detail::unreadable(title, detail::kMountsPath, r.error());
+        return detail::unreadable(title, detail::kMountInfoPath, r.error());
+    std::vector<std::vector<std::string_view>> tmp;  // fields of each /tmp entry
     for (const auto& line : *r) {
-        if (line.find(" /tmp ") == std::string::npos)
-            continue;
-        const bool has_noexec = line.find("noexec") != std::string::npos;
-        return ConfigCheckResult{
-            has_noexec ? "INFO" : "MEDIUM", title,
-            has_noexec ? "/tmp is mounted with noexec"
-                       : "/tmp is not mounted with noexec - executables can run from /tmp",
-            has_noexec};
+        auto fields = detail::split_fields(line);
+        if (fields.size() >= 5 && fields[4] == "/tmp")
+            tmp.push_back(std::move(fields));
     }
-    return std::nullopt;
+    if (tmp.empty())
+        return std::nullopt;
+    std::set<std::string_view> parents;
+    for (const auto& m : tmp)
+        parents.insert(m[1]);
+    int tops = 0;
+    int noexec_tops = 0;
+    for (const auto& m : tmp) {
+        if (parents.contains(m[0]))
+            continue;
+        ++tops;
+        if (m.size() >= 6 && detail::has_mount_option(m[5], "noexec"))
+            ++noexec_tops;
+    }
+    const bool has_noexec = tops > 0 && noexec_tops == tops;  // no top: fail closed
+    return ConfigCheckResult{
+        has_noexec ? "INFO" : "MEDIUM", title,
+        has_noexec ? "/tmp is mounted with noexec"
+                   : "/tmp is not mounted with noexec - executables can run from /tmp",
+        has_noexec};
 }
 
 // ── Subprocess helper (Linux / macOS) ──────────────────────────────────────
@@ -426,7 +476,7 @@ inline std::vector<ConfigCheckResult> run_linux_checks() {
     results.push_back(aslr_check(detail::read_proc_value(detail::kAslrPath.data())));
     results.push_back(suid_dumpable_check(detail::read_proc_value(detail::kSuidPath.data())));
 
-    if (auto t = tmp_noexec_check(detail::read_lines(detail::kMountsPath.data())))
+    if (auto t = tmp_noexec_check(detail::read_lines(detail::kMountInfoPath.data())))
         results.push_back(std::move(*t));
 
     // Firewall (iptables/nftables)

@@ -1384,7 +1384,7 @@ affected: a service-scoped token is already refused at their first gate, `Execut
 
 ## Behaviour change: vuln_scan reports an unreadable config check as UNREADABLE and adds a summary row (#4961)
 
-On Linux, `vuln_scan` (`scan`, `config_scan`) now reports a config file it could not read (`/proc/sys/kernel/randomize_va_space`, `/proc/sys/fs/suid_dumpable`, `/etc/ssh/sshd_config`, `/proc/mounts`) as `UNREADABLE|config|<title>|<path>: <cause>` instead of a HIGH/MEDIUM finding. `summary` always emits a seventh row, `summary|UNREADABLE|<n>`, and an absent `sshd_config` reads INFO "not applicable" with the SSH password row now emitted.
+On Linux, `vuln_scan` (`scan`, `config_scan`) now reports a config file it could not read (`/proc/sys/kernel/randomize_va_space`, `/proc/sys/fs/suid_dumpable`, `/etc/ssh/sshd_config`, `/proc/self/mountinfo`) as `UNREADABLE|config|<title>|<path>: <cause>` instead of a HIGH/MEDIUM finding. `summary` always emits a seventh row, `summary|UNREADABLE|<n>`, and an absent `sshd_config` reads INFO "not applicable" with the SSH password row now emitted.
 
 - **Affected:** scripts that index `summary` positionally or assert six rows; CEL or severity filters (a "no critical/high" policy passes a host it could not measure); dashboards keyed on MEDIUM counts on RHEL-family hosts where a non-root agent cannot read a mode-0600 `sshd_config`.
 - **Recommended:** treat `UNREADABLE` as not assessed, and use `summary|UNREADABLE|<n>` as the coverage signal.

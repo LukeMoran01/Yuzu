@@ -74,31 +74,104 @@ TEST_CASE("tmp_noexec_check: unreadable, no /tmp mount, noexec and exec", "[vuln
     REQUIRE(unreadable.has_value());
     CHECK(unreadable->severity == "UNREADABLE");
     CHECK(unreadable->title == "/tmp noexec");
-    CHECK(unreadable->detail == "/proc/mounts: eacces");
+    CHECK(unreadable->detail == "/proc/self/mountinfo: eacces");
     CHECK_FALSE(unreadable->passed);
 
-    CHECK_FALSE(tmp_noexec_check(lines({"proc /proc proc rw,nosuid,nodev,noexec 0 0",
-                                        "/dev/sda1 / ext4 rw,relatime 0 0"}))
-                    .has_value());
-    CHECK_FALSE(tmp_noexec_check(lines({"tmpfs /var/tmp tmpfs rw,noexec 0 0",
-                                        "tmpfs /tmp/x tmpfs rw,noexec 0 0"}))
-                    .has_value()); // ' /tmp ' is a whole-field match
+    CHECK_FALSE(
+        tmp_noexec_check(lines({"22 1 0:21 / /proc rw,nosuid,nodev,noexec - proc proc rw",
+                                "1 0 8:1 / / rw,relatime - ext4 /dev/sda1 rw"}))
+            .has_value());
+    CHECK_FALSE(tmp_noexec_check(lines({"30 1 0:30 / /var/tmp rw,noexec - tmpfs tmpfs rw",
+                                        "31 1 0:31 / /tmp/x rw,noexec - tmpfs tmpfs rw"}))
+                    .has_value()); // the mount point must be exactly /tmp
 
     auto noexec = tmp_noexec_check(
-        lines({"/dev/sda1 / ext4 rw,relatime 0 0",
-               "tmpfs /tmp tmpfs rw,nosuid,nodev,noexec,relatime 0 0"}));
+        lines({"1 0 8:1 / / rw,relatime - ext4 /dev/sda1 rw",
+               "40 1 0:40 / /tmp rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw"}));
     REQUIRE(noexec.has_value());
     CHECK(noexec->severity == "INFO");
     CHECK(noexec->title == "/tmp noexec");
     CHECK(noexec->detail == "/tmp is mounted with noexec");
     CHECK(noexec->passed);
 
-    auto exec = tmp_noexec_check(lines({"tmpfs /tmp tmpfs rw,nosuid,nodev,relatime 0 0"}));
+    auto exec = tmp_noexec_check(lines({"40 1 0:40 / /tmp rw,nosuid,nodev - tmpfs tmpfs rw"}));
     REQUIRE(exec.has_value());
     CHECK(exec->severity == "MEDIUM");
     CHECK(exec->title == "/tmp noexec");
     CHECK(exec->detail == "/tmp is not mounted with noexec - executables can run from /tmp");
     CHECK_FALSE(exec->passed);
+}
+
+TEST_CASE("tmp_noexec_check: the top /tmp mount wins, by parent ID (#5517)", "[vuln][config]") {
+    // An exec mount created first, then moved over a noexec /tmp: the top is
+    // listed first (captured from a kernel 6.12 mount namespace).
+    auto moved_exec = tmp_noexec_check(
+        lines({"1971 1972 0:214 / /tmp rw,relatime - tmpfs tmpA rw,uid=999,gid=1000",
+               "1972 1910 0:215 / /tmp rw,noexec,relatime - tmpfs tmpB rw,uid=999,gid=1000"}));
+    REQUIRE(moved_exec.has_value());
+    CHECK(moved_exec->severity == "MEDIUM");
+    CHECK_FALSE(moved_exec->passed);
+
+    auto moved_noexec = tmp_noexec_check(
+        lines({"1971 1972 0:214 / /tmp rw,noexec,relatime - tmpfs tmpA rw",
+               "1972 1910 0:215 / /tmp rw,relatime - tmpfs tmpB rw"}));
+    REQUIRE(moved_noexec.has_value());
+    CHECK(moved_noexec->severity == "INFO");
+    CHECK(moved_noexec->passed);
+
+    // Ordinary stacking: the later mount is on top and listed last.
+    auto stacked_exec =
+        tmp_noexec_check(lines({"40 1 0:40 / /tmp rw,noexec - tmpfs tmpfs rw",
+                                "41 40 0:41 / /tmp rw,nosuid - tmpfs tmpfs rw"}));
+    REQUIRE(stacked_exec.has_value());
+    CHECK(stacked_exec->severity == "MEDIUM");
+    CHECK_FALSE(stacked_exec->passed);
+}
+
+TEST_CASE("tmp_noexec_check: noexec only as an exact per-mount option", "[vuln][config]") {
+    // In the source or the superblock options, noexec is not a mount option.
+    auto source = tmp_noexec_check(lines({"40 1 8:2 / /tmp rw - ext4 /dev/noexec0 rw,noexec"}));
+    REQUIRE(source.has_value());
+    CHECK(source->severity == "MEDIUM");
+    CHECK_FALSE(source->passed);
+
+    auto substring = tmp_noexec_check(lines({"40 1 0:40 / /tmp rw,xnoexec,noexecx - tmpfs t rw"}));
+    REQUIRE(substring.has_value());
+    CHECK(substring->severity == "MEDIUM");
+    CHECK_FALSE(substring->passed);
+
+    // A /tmp entry too short to carry mount options fails closed: not noexec.
+    auto short_line = tmp_noexec_check(lines({"40 1 0:40 / /tmp"}));
+    REQUIRE(short_line.has_value());
+    CHECK(short_line->severity == "MEDIUM");
+    CHECK_FALSE(short_line->passed);
+
+    // A /tmp line too short to name a mount point is not a /tmp mount.
+    CHECK_FALSE(tmp_noexec_check(lines({"40 1 0:40 /tmp"})).has_value());
+}
+
+TEST_CASE("tmp_noexec_check: several or no tops (#5517)", "[vuln][config]") {
+    // An overmounted ancestor (mount --rbind / /) leaves two unrelated /tmp
+    // tops (captured from a kernel 6.12 mount namespace). Both noexec: pass.
+    auto two_noexec = tmp_noexec_check(lines({"1970 1910 0:172 / /tmp rw,noexec - tmpfs a rw",
+                                              "1996 1971 0:172 / /tmp rw,noexec - tmpfs a rw"}));
+    REQUIRE(two_noexec.has_value());
+    CHECK(two_noexec->severity == "INFO");
+    CHECK(two_noexec->passed);
+
+    // Tops that disagree fail closed.
+    auto mixed = tmp_noexec_check(lines({"40 1 0:40 / /tmp rw,noexec - tmpfs a rw",
+                                         "41 2 0:41 / /tmp rw - tmpfs b rw"}));
+    REQUIRE(mixed.has_value());
+    CHECK(mixed->severity == "MEDIUM");
+    CHECK_FALSE(mixed->passed);
+
+    // A parent-ID cycle has no top: fail closed.
+    auto cycle = tmp_noexec_check(lines({"40 41 0:40 / /tmp rw,noexec - tmpfs a rw",
+                                         "41 40 0:41 / /tmp rw,noexec - tmpfs b rw"}));
+    REQUIRE(cycle.has_value());
+    CHECK(cycle->severity == "MEDIUM");
+    CHECK_FALSE(cycle->passed);
 }
 
 // ── suid_dumpable ───────────────────────────────────────────────────────────
